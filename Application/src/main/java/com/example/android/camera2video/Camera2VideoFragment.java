@@ -26,6 +26,7 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
@@ -37,6 +38,7 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
@@ -58,6 +60,7 @@ import android.widget.Toast;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -231,6 +234,7 @@ public class Camera2VideoFragment extends Fragment
      * @param choices The list of available sizes
      * @return The video size
      */
+    //这个函数根据长宽比，选择只支持长宽比为4:3的分辨率，同时宽小于1080p
     private static Size chooseVideoSize(Size[] choices) {
         for (Size size : choices) {
             if (size.getWidth() == size.getHeight() * 4 / 3 && size.getWidth() <= 1080) {
@@ -252,8 +256,10 @@ public class Camera2VideoFragment extends Fragment
      * @param aspectRatio The aspect ratio
      * @return The optimal {@code Size}, or an arbitrary one if none were big enough
      */
+    //这个函数选择长比宽为aspectRotio一样的分辨率，同时如果长宽大于指定的宽高，就选用中间最小的一个，否则选用choices[0]
     private static Size chooseOptimalSize(Size[] choices, int width, int height, Size aspectRatio) {
         // Collect the supported resolutions that are at least as big as the preview Surface
+        //选择合适的长宽比的分辨率
         List<Size> bigEnough = new ArrayList<Size>();
         int w = aspectRatio.getWidth();
         int h = aspectRatio.getHeight();
@@ -262,12 +268,14 @@ public class Camera2VideoFragment extends Fragment
                     option.getWidth() >= width && option.getHeight() >= height) {
                 bigEnough.add(option);
             }
+
         }
 
         // Pick the smallest of those, assuming we found any
         if (bigEnough.size() > 0) {
             return Collections.min(bigEnough, new CompareSizesByArea());
-        } else {
+        }
+        else {
             Log.e(TAG, "Couldn't find any suitable preview size");
             return choices[0];
         }
@@ -333,8 +341,10 @@ public class Camera2VideoFragment extends Fragment
      * Starts a background thread and its {@link Handler}.
      */
     private void startBackgroundThread() {
+        //这里利用handlerThread来创建一个线程
         mBackgroundThread = new HandlerThread("CameraBackground");
-        mBackgroundThread.start();
+        mBackgroundThread.start();//启动线程
+        //这里创建一个handler，并将该handler绑定mBackgroundThread线程的消息looper对象，这样就可以利用这个handler来在mBackgroundThread中做事情了
         mBackgroundHandler = new Handler(mBackgroundThread.getLooper());
     }
 
@@ -432,21 +442,32 @@ public class Camera2VideoFragment extends Fragment
 
             // Choose the sizes for camera preview and video recording
             CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
-            StreamConfigurationMap map = characteristics
-                    .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            //相机支持可用流配置属性，包括最低帧持续时间和大小尺寸等
+            StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            //获取摄像头方向
             mSensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            //选择满足4:3的长宽比例的尺寸分辨率
             mVideoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder.class));
+            //获取一下摄像头支持的最大分辨率，防止摄像头不支持，导致没有图像
+            Size cameraLargest= Collections.max(Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),new CompareSizesByArea());
+            //获取最佳的长宽比预览尺寸
+//            mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class),
+//                    width, height, mVideoSize);
+            //针对rk3288-walkera-board，camera只能打开720p
             mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class),
-                    width, height, mVideoSize);
-
+                    1280, 720, cameraLargest);
+            //获取屏幕的方向
             int orientation = getResources().getConfiguration().orientation;
-            if (orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            if (orientation == Configuration.ORIENTATION_LANDSCAPE) {//当前为横屏
                 mTextureView.setAspectRatio(mPreviewSize.getWidth(), mPreviewSize.getHeight());
-            } else {
+            } else {//当前为竖屏
                 mTextureView.setAspectRatio(mPreviewSize.getHeight(), mPreviewSize.getWidth());
             }
+            //配置转换矩阵，用于渲染和旋转等作用
             configureTransform(width, height);
+            //创建一个用于录制音视频用的对象
             mMediaRecorder = new MediaRecorder();
+            //打开camera
             manager.openCamera(cameraId, mStateCallback, null);
         } catch (CameraAccessException e) {
             Toast.makeText(activity, "Cannot access the camera.", Toast.LENGTH_SHORT).show();
@@ -488,15 +509,21 @@ public class Camera2VideoFragment extends Fragment
             return;
         }
         try {
+            //关闭之前的预览会话
             closePreviewSession();
+            //获取渲染用的surface texture
             SurfaceTexture texture = mTextureView.getSurfaceTexture();
             assert texture != null;
+            //设置默认缓存
             texture.setDefaultBufferSize(mPreviewSize.getWidth(), mPreviewSize.getHeight());
+            // 创建预览需要的CaptureRequest.Builder
             mPreviewBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
 
             Surface previewSurface = new Surface(texture);
+            // 将SurfaceView的surface作为CaptureRequest.Builder的目标
             mPreviewBuilder.addTarget(previewSurface);
 
+            // 创建CameraCaptureSession，该对象负责管理处理预览请求和拍照请求
             mCameraDevice.createCaptureSession(Arrays.asList(previewSurface), new CameraCaptureSession.StateCallback() {
 
                 @Override
@@ -529,6 +556,7 @@ public class Camera2VideoFragment extends Fragment
             setUpCaptureRequestBuilder(mPreviewBuilder);
             HandlerThread thread = new HandlerThread("CameraPreview");
             thread.start();
+            //这里发送预览请求
             mPreviewSession.setRepeatingRequest(mPreviewBuilder.build(), null, mBackgroundHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
@@ -536,6 +564,7 @@ public class Camera2VideoFragment extends Fragment
     }
 
     private void setUpCaptureRequestBuilder(CaptureRequest.Builder builder) {
+        //设置控制模式为自动模式
         builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
     }
 
@@ -610,7 +639,9 @@ public class Camera2VideoFragment extends Fragment
         }
         try {
             closePreviewSession();
+            //对录像进行参数配置
             setUpMediaRecorder();
+
             SurfaceTexture texture = mTextureView.getSurfaceTexture();
             assert texture != null;
             texture.setDefaultBufferSize(mPreviewSize.getWidth(), mPreviewSize.getHeight());
@@ -675,9 +706,23 @@ public class Camera2VideoFragment extends Fragment
         // UI
         mIsRecordingVideo = false;
         mButtonVideo.setText(R.string.record);
+        //modefy by lihaiping1603@aliyun.com on20161207
+        //这个地方需要优化一下，防止录像的时候会崩溃
+        try{
+            mPreviewSession.abortCaptures();
+        }catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+
+        //试一下使用close方式,在录像stop前，调用关闭也是可以解决崩溃的问题的
+//        closePreviewSession();
+
         // Stop recording
         mMediaRecorder.stop();
         mMediaRecorder.reset();
+        //在停止录像以后调用关闭会话，程序会崩溃
+//        //试一下使用close方式
+//        closePreviewSession();
 
         Activity activity = getActivity();
         if (null != activity) {
@@ -686,6 +731,7 @@ public class Camera2VideoFragment extends Fragment
             Log.d(TAG, "Video saved: " + mNextVideoAbsolutePath);
         }
         mNextVideoAbsolutePath = null;
+
         startPreview();
     }
 
